@@ -1,53 +1,48 @@
 import OpenAI from 'openai';
 import ytdl from '@distube/ytdl-core';
-import fs, { writeFileSync } from 'fs';
+import fs, { existsSync, writeFileSync } from 'fs';
 import path from 'path';
-import ffmpeg from 'fluent-ffmpeg';
-import ffmpegInstaller from '@ffmpeg-installer/ffmpeg';
+import { youtubeDl as youtubedl } from 'youtube-dl-exec';
 
-ffmpeg.setFfmpegPath(ffmpegInstaller.path);
-
-async function downloadYouTubeVideo(videoUrl: string, outputDir: string): Promise<string> {
-  const videoId = ytdl.getURLVideoID(videoUrl); // Ensure compatibility with the new library
-  const outputPath = path.join(outputDir, `${videoId}.mp4`);
+async function downloadSubtitles(videoUrl: string, outputDir: string): Promise<string> {
+  const videoId = ytdl.getURLVideoID(videoUrl);
+  const subtitlesPath = path.join(outputDir, `${videoId}`);
 
   return new Promise((resolve, reject) => {
-    const videoStream = ytdl(videoUrl, { quality: 'highestaudio' }); // Update usage if necessary
-    const writeStream = fs.createWriteStream(outputPath);
-
-    videoStream.pipe(writeStream);
-
-    writeStream.on('finish', () => resolve(outputPath));
-    writeStream.on('error', (err) => reject(err));
+    youtubedl(videoUrl, {
+      // writeSub: true,
+      // subLang: 'en',
+      writeAutoSub: true,
+      skipDownload: true,
+      output: subtitlesPath,
+    })
+      .then(() => {
+        resolve(subtitlesPath + '.en.vtt');
+      })
+      .catch((err) => {
+        reject(err);
+      });
   });
 }
 
-async function extractAudio(videoPath: string, outputAudioPath: string): Promise<string> {
-  return new Promise((resolve, reject) => {
-    ffmpeg(videoPath)
-      .output(outputAudioPath)
-      .noVideo()
-      .audioCodec('libmp3lame')
-      .on('end', () => resolve(outputAudioPath))
-      .on('error', (err) => reject(err))
-      .run();
-  });
-}
+function splitTextIntoChunks(text: string, chunkSize: number): string[] {
+  const chunks: string[] = [];
+  let currentChunk = '';
 
-async function transcribeAudio(audioPath: string): Promise<string> {
-  const openai = new OpenAI({
-    apiKey: process.env.OPENAI_API_KEY,
-  });
+  for (const line of text.split('\n')) {
+    if ((currentChunk + line).length > chunkSize) {
+      chunks.push(currentChunk);
+      currentChunk = line; // Start a new chunk
+    } else {
+      currentChunk += (currentChunk ? '\n' : '') + line; // Append line to the current chunk
+    }
+  }
 
-  const audioStream = fs.createReadStream(audioPath); // Use FsReadStream instead of Readable
+  if (currentChunk) {
+    chunks.push(currentChunk); // Add the last chunk
+  }
 
-  const response = await openai.audio.transcriptions.create({
-    file: audioStream,
-    model: 'whisper-1',
-    response_format: 'text',
-  });
-
-  return response; // Directly return the response as it contains the transcription result
+  return chunks;
 }
 
 async function translateTextWithGPT(text: string, targetLanguage: string): Promise<string> {
@@ -55,19 +50,31 @@ async function translateTextWithGPT(text: string, targetLanguage: string): Promi
     apiKey: process.env.OPENAI_API_KEY,
   });
 
-  const prompt = `Translate the following text into ${targetLanguage}:
+  const chunks = splitTextIntoChunks(text, 2000); // Split text into chunks of 2000 characters
+  const translations = [];
 
-${text}`;
+  for (const [index, chunk] of chunks.entries()) {
+    console.log(`Translating chunk ${index + 1}/${chunks.length}...`);
+    const prompt = `
+    Translate the following text into ${targetLanguage}. 
+    Keep the original format,
+    And only translate the text, no extra information, no code blocks, no markdown, no quotes, no explanations.\n\n
+    Ensure the entire content is translated without skipping any parts:
 
-  const response = await openai.chat.completions.create({
-    model: 'o4-mini',
-    messages: [
-      { role: 'system', content: 'You are a helpful assistant that translates text.' },
-      { role: 'user', content: prompt },
-    ],
-  });
+${chunk}`;
 
-  return response.choices[0].message?.content || '';
+    const response = await openai.chat.completions.create({
+      model: 'o4-mini',
+      messages: [
+        { role: 'system', content: 'You are a helpful assistant that translates text.' },
+        { role: 'user', content: prompt },
+      ],
+    });
+
+    translations.push(response.choices[0].message?.content || '');
+  }
+
+  return translations.join('\n');
 }
 
 async function generateDoubleSubtitles(transcription: string): Promise<string> {
@@ -78,14 +85,8 @@ async function generateDoubleSubtitles(transcription: string): Promise<string> {
 }
 
 async function main() {
-  console.log('Welcome to the YouTube Video Transcriber!');
+  console.log('Welcome to the YouTube Subtitle Translator!');
 
-  // Example: Initialize OpenAI API
-  const openai = new OpenAI({
-    apiKey: process.env.OPENAI_API_KEY,
-  });
-
-  // Example usage of downloadYouTubeVideo
   const videoUrl = 'https://www.youtube.com/watch?v=BdfsuRS8UfA'; // Replace with actual URL
   const outputDir = path.resolve(__dirname, '../downloads');
 
@@ -94,31 +95,21 @@ async function main() {
   }
 
   try {
-    console.log('Downloading video...');
-    const videoPath = await downloadYouTubeVideo(videoUrl, outputDir);
-    console.log(`Video downloaded to: ${videoPath}`);
+    console.log('Downloading subtitles...');
+    const subtitlesPath = await downloadSubtitles(videoUrl, outputDir);
+    console.log(`Subtitles downloaded to: ${subtitlesPath}`);
 
-    console.log('Extracting audio...');
-    const audioPath = path.join(outputDir, `${ytdl.getURLVideoID(videoUrl)}.mp3`);
-    await extractAudio(videoPath, audioPath);
-    console.log(`Audio extracted to: ${audioPath}`);
+    const originalSubtitles = fs.readFileSync(subtitlesPath, 'utf-8');
 
-    console.log('Transcribing audio...');
-    const transcription = await transcribeAudio(audioPath);
-    console.log('Transcription:', transcription);
+    console.log('Translating subtitles...');
+    const translatedSubtitles = await translateTextWithGPT(originalSubtitles, 'Simplified Chinese');
 
-    console.log('Generating double subtitles...');
-    const doubleSubtitles = await generateDoubleSubtitles(transcription);
-
-    const subtitlesPath = path.join(outputDir, `${ytdl.getURLVideoID(videoUrl)}_subtitles.txt`);
-    writeFileSync(subtitlesPath, doubleSubtitles, 'utf-8');
-    console.log(`Double subtitles saved to: ${subtitlesPath}`);
+    const translatedPath = path.join(outputDir, `${ytdl.getURLVideoID(videoUrl)}.cn.vtt`);
+    fs.writeFileSync(translatedPath, translatedSubtitles, 'utf-8');
+    console.log(`Translated subtitles saved to: ${translatedPath}`);
   } catch (error) {
     console.error('Error:', error);
   }
-
-  // Placeholder for further processing
-  console.log('This is where the translation logic will go.');
 }
 
 main().catch((error) => console.error('Error:', error));

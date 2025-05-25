@@ -16,9 +16,7 @@ npm-debug.log*
 .env
 
 # Downloaded files
-downloads/*.mp4
-downloads/*.mp3
-downloads/*_subtitles.txt
+downloads/
 
 # TypeScript
 *.tsbuildinfo
